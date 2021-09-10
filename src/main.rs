@@ -1,6 +1,8 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+use lazy_static::lazy_static;
+use std::sync::{Mutex, Arc};
 use log::error;
 use pixels::{Error, Pixels, SurfaceTexture};
 use winit::dpi::LogicalSize;
@@ -8,118 +10,127 @@ use winit::event::{Event, VirtualKeyCode};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 use winit_input_helper::WinitInputHelper;
+use std::rc::Rc;
 
-const WIDTH: u32 = 160;
-const HEIGHT: u32 = 144;
-const BOX_SIZE: i16 = 64;
 
-/// Representation of the application state. In this example, a box will bounce around the screen.
-struct World {
-    box_x: i16,
-    box_y: i16,
-    velocity_x: i16,
-    velocity_y: i16,
+#[allow(unused_macros)]
+macro_rules! opcrel {
+    ($a: expr) => {
+        $a
+    }
 }
 
-fn main() -> Result<(), Error> {
-    env_logger::init();
-    let event_loop = EventLoop::new();
-    let mut input = WinitInputHelper::new();
-    let window = {
-        let size = LogicalSize::new(WIDTH as f64, HEIGHT as f64);
-        WindowBuilder::new()
-            .with_title("AlooEmu")
-            .with_inner_size(size)
-            .with_min_inner_size(size)
-            .build(&event_loop)
-            .unwrap()
-    };
-
-    let mut pixels = {
-        let window_size = window.inner_size();
-        let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
-        Pixels::new(WIDTH, HEIGHT, surface_texture)?
-    };
-    let mut world = World::new();
-
-    event_loop.run(move |event, _, control_flow| {
-        // Draw the current frame
-        if let Event::RedrawRequested(_) = event {
-            world.draw(pixels.get_frame());
-            if pixels
-                .render()
-                .map_err(|e| error!("pixels.render() failed: {}", e))
-                .is_err()
-            {
-                *control_flow = ControlFlow::Exit;
-                return;
-            }
-        }
-
-        // Handle input events
-        if input.update(&event) {
-            // Close events
-            if input.key_pressed(VirtualKeyCode::Escape) || input.quit() {
-                *control_flow = ControlFlow::Exit;
-                return;
-            }
-
-            // Resize the window
-            if let Some(size) = input.window_resized() {
-                pixels.resize_surface(size.width, size.height);
-            }
-
-            // Update internal state and request a redraw
-            world.update();
-            window.request_redraw();
-        }
-    });
+lazy_static!{
+    static ref EMULATOR_STATE: Mutex<EmulatorState> = Mutex::new(EmulatorState::default());
 }
 
-impl World {
-    /// Create a new `World` instance that can draw a moving box.
-    fn new() -> Self {
-        Self {
-            box_x: 8,
-            box_y: 8,
-            velocity_x: 2,
-            velocity_y: 2,
+struct EmulatorState {
+    op_code: u8,
+    op_crel: u8,
+    temp8: u8,
+    operand: u8,
+    carry: u8,
+    negative: u8,
+    rom0: u8,
+    rom1: u8,
+    io: [u8; 512],
+    video_ram: [u8; 8192],
+    work_ram: [u8; 16384],
+    external_ram: u8,
+    external_ram_bank: u8,
+    reg16: [u16; 16],
+    ime: u8,
+    halt: u8,
+    key_state: u8,
+    /* i16 (2 byte) variables */
+    program_counter: i16,
+
+}
+
+impl Default for EmulatorState {
+    fn default() -> Self {
+        EmulatorState{
+            op_code: 0,
+            op_crel: 0,
+            temp8: 0,
+            operand: 0,
+            carry: 0,
+            negative: 0,
+            rom0: 0,
+            rom1: 0,
+            io: [0; 512],
+            video_ram: [0; 8192],
+            work_ram: [0; 16384],
+            external_ram: 0,
+            external_ram_bank: 0,
+            reg16: [19, 0, 216, 0, 77, 1, 176, 1, 0, 0, 0, 0 ,0 ,0, 0, 0], /* F=reg8[6] A=reg8[7]*/
+            ime: 0,
+            halt: 0,
+            key_state: 0,
+            program_counter: 0
         }
     }
+}
 
-    /// Update the `World` internal state; bounce the box around the screen.
-    fn update(&mut self) {
-        if self.box_x <= 0 || self.box_x + BOX_SIZE > WIDTH as i16 {
-            self.velocity_x *= -1;
-        }
-        if self.box_y <= 0 || self.box_y + BOX_SIZE > HEIGHT as i16 {
-            self.velocity_y *= -1;
-        }
+impl EmulatorState {
 
-        self.box_x += self.velocity_x;
-        self.box_y += self.velocity_y;
+    fn reg8(&self) -> [u8; 8] {
+        [
+            self.reg16[0] as u8,
+            self.reg16[1] as u8,
+            self.reg16[2] as u8,
+            self.reg16[3] as u8,
+            self.reg16[4] as u8,
+            self.reg16[5] as u8,
+            self.reg16[6] as u8,
+            self.reg16[7] as u8,
+        ]
     }
 
-    /// Draw the `World` state to the frame buffer.
-    ///
-    /// Assumes the default texture format: `wgpu::TextureFormat::Rgba8UnormSrgb`
-    fn draw(&self, frame: &mut [u8]) {
-        for (i, pixel) in frame.chunks_exact_mut(4).enumerate() {
-            let x = (i % WIDTH as usize) as i16;
-            let y = (i / WIDTH as usize) as i16;
-
-            let inside_the_box = x >= self.box_x
-                && x < self.box_x + BOX_SIZE
-                && y >= self.box_y
-                && y < self.box_y + BOX_SIZE;
-
-            let rgba = if inside_the_box {
-                [0x5e, 0x48, 0xe8, 0xff]
-            } else {
-                [0x48, 0xb2, 0xe8, 0xff]
-            };
-
-            pixel.copy_from_slice(&rgba);
-        }
+    fn f(&self) -> u8 {
+        self.reg8()[6]
     }
+
+    fn a(&self) -> u8 {
+        self.reg8()[7]
+    }
+
+    fn i_f(&self) -> u8 {
+        self.io[271]
+    }
+
+    fn l_c_d_c(&self) -> u8 {
+        self.io[320]
+    }
+
+    fn l_y(&self) -> u8 {
+        self.io[324]
+    }
+
+    fn get_h_l(&self) -> u16 {
+        self.reg16[2]
+    }
+
+    fn set_h_l(&mut self, value: u16) {
+        self.reg16[2] = value
+    }
+
+
+}
+
+
+
+fn main() {
+
+    println!("{:?}", EMULATOR_STATE.lock().unwrap().reg16);
+
+    EMULATOR_STATE.lock().unwrap().set_h_l(200);
+
+    println!("{:?}", EMULATOR_STATE.lock().unwrap().reg16)
+
+}
+
+
+fn tick(cycles: &i32) -> i32 {
+    return cycles + 4
 }
